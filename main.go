@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // Command line flags
@@ -45,22 +46,42 @@ func init() {
 func main() {
 	flag.Parse()
 
-	// Get directories to list
-	dirs := flag.Args()
-	if len(dirs) == 0 {
-		dirs = []string{"."}
+	// Get directories or files to list
+	args := flag.Args()
+	if len(args) == 0 {
+		args = []string{"."}
 	}
 
-	// List files for each directory
-	for i, dir := range dirs {
+	// List files for each argument
+	for i, arg := range args {
 		if i > 0 {
 			fmt.Println()
 		}
-		err := listFiles(dir, false)
+
+		err := handleSingleFile(arg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "my-ls: cannot access '%s': %v\n", dir, err)
+			fmt.Fprintf(os.Stderr, "my-ls: cannot access '%s': %v\n", arg, err)
 		}
 	}
+}
+
+func handleSingleFile(path string) error {
+	fileInfo, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+
+	if fileInfo.IsDir() {
+		return listFiles(path, false)
+	}
+
+	// It's a file, just print its name
+	if longFormat {
+		printLongFormat([]fs.FileInfo{fileInfo}, filepath.Dir(path))
+	} else {
+		fmt.Println(getColoredName(fileInfo, path))
+	}
+	return nil
 }
 
 func listFiles(dir string, isRecursive bool) error {
@@ -71,7 +92,7 @@ func listFiles(dir string, isRecursive bool) error {
 
 	var files []fs.FileInfo
 	for _, entry := range entries {
-		info, err := entry.Info()
+		info, err := os.Lstat(filepath.Join(dir, entry.Name()))
 		if err != nil {
 			return err
 		}
@@ -96,9 +117,9 @@ func listFiles(dir string, isRecursive bool) error {
 
 	// Display file list
 	if longFormat {
-		printLongFormat(files)
+		printLongFormat(files, dir)
 	} else {
-		printShortFormat(files)
+		printShortFormat(files, dir)
 	}
 
 	// Handle recursive listing
@@ -154,40 +175,52 @@ func sortFiles(files []fs.FileInfo) {
 	})
 }
 
-func printShortFormat(files []fs.FileInfo) {
+func printShortFormat(files []fs.FileInfo, dir string) {
 	var names []string
-	maxLen := 0
+	maxLen := 1
 
-	// First, add . and .. if showAll is true
+	// Add . and .. if showAll is true
 	if showAll {
-		names = append(names, ".", "..")
+		names = append(names, getColoredName(&dirInfo{"."}, dir))
+		names = append(names, getColoredName(&dirInfo{".."}, dir))
 	}
 
-	// Then add the rest of the files
+	// Collect the file names and calculate the maximum name length
 	for _, file := range files {
-		name := getColoredName(file)
+		name := getColoredName(file, filepath.Join(dir, file.Name()))
 		names = append(names, name)
-		if len(stripANSI(name)) > maxLen {
-			maxLen = len(stripANSI(name))
+		plainName := stripANSI(name)
+		if len(plainName) > maxLen {
+			maxLen = len(plainName)
 		}
 	}
 
-	// Use a fixed terminal width
-	termWidth := 80
-	columnWidth := maxLen + 2 // Add 2 for spacing
-	numCols := termWidth / columnWidth
-	if numCols == 0 {
+	// Calculate the column width (maxLen + 2 for padding between columns)
+	columnWidth := maxLen + 2
+	width := 80
+	numCols := width / columnWidth
+
+	if numCols <= 0 {
 		numCols = 1
 	}
 
-	// Print files in columns
-	for i, name := range names {
-		plainName := stripANSI(name)
-		padding := strings.Repeat(" ", columnWidth-len(plainName))
-		fmt.Print(name + padding)
-		if (i+1)%numCols == 0 || i == len(names)-1 {
-			fmt.Println()
+	// Print the files row by row
+	currentColumn := 0
+	for _, name := range names {
+		fmt.Print(name)
+		currentColumn += len(stripANSI(name)) + 2 // Account for name and spacing
+		if currentColumn >= width {
+			fmt.Println() // Move to the next line
+			currentColumn = 0
+		} else {
+			// Add padding if not the last column
+			fmt.Print(strings.Repeat(" ", columnWidth-len(stripANSI(name))))
 		}
+	}
+
+	// If the last row was not full, add a newline
+	if currentColumn != 0 {
+		fmt.Println()
 	}
 }
 
@@ -196,28 +229,45 @@ func stripANSI(str string) string {
 	return ansi.ReplaceAllString(str, "")
 }
 
-func getColoredName(file fs.FileInfo) string {
+func getColoredName(file fs.FileInfo, path string) string {
 	name := file.Name()
 	if name == "." || name == ".." {
-		return name
+		return colorBlue + name + colorReset
 	}
 	name = filepath.Base(name)
 
-	if file.IsDir() {
+	if file.Mode()&os.ModeSymlink != 0 {
+		linkTarget, err := os.Readlink(path)
+		if err == nil {
+			return colorCyan + name + colorReset + " -> " + linkTarget
+		}
+		return colorCyan + name + colorReset
+	} else if file.IsDir() {
 		return colorBlue + name + colorReset
 	} else if file.Mode()&0111 != 0 {
 		return colorGreen + name + colorReset
-	} else if file.Mode()&os.ModeSymlink != 0 {
-		return colorCyan + name + colorReset
 	}
 	return name
 }
 
 func getGroupName(gid uint32) string {
+	group, err := user.LookupGroupId(strconv.Itoa(int(gid)))
+	if err == nil {
+		return group.Name
+	}
 	return strconv.FormatUint(uint64(gid), 10)
 }
 
-func printLongFormat(files []fs.FileInfo) {
+func formatTime(t time.Time) string {
+	now := time.Now()
+	sixMonthsAgo := now.AddDate(0, -6, 0)
+	if t.Before(sixMonthsAgo) || t.After(now) {
+		return t.Format("Jan _2  2006")
+	}
+	return t.Format("Jan _2 15:04")
+}
+
+func printLongFormat(files []fs.FileInfo, dir string) {
 	maxLinkLen, maxUserLen, maxGroupLen, maxSizeLen, maxNameLen := 0, 0, 0, 0, 0
 
 	// First pass: calculate maximum lengths for each column
@@ -247,7 +297,7 @@ func printLongFormat(files []fs.FileInfo) {
 			maxSizeLen = sizeLen
 		}
 
-		nameLen := len(stripANSI(getColoredName(file)))
+		nameLen := len(stripANSI(getColoredName(file, filepath.Join(dir, file.Name()))))
 		if nameLen > maxNameLen {
 			maxNameLen = nameLen
 		}
@@ -264,18 +314,32 @@ func printLongFormat(files []fs.FileInfo) {
 
 		groupname := getGroupName(stat.Gid)
 
-		coloredName := getColoredName(file)
-		plainName := stripANSI(coloredName)
-		namePadding := strings.Repeat(" ", maxNameLen-len(plainName))
+		coloredName := getColoredName(file, filepath.Join(dir, file.Name()))
 
-		fmt.Printf("%s %*d %-*s %-*s %*d %s %s%s\n",
+		size := strconv.FormatInt(file.Size(), 10)
+		if file.Mode()&os.ModeSymlink != 0 {
+			size = "0"
+		}
+
+		fmt.Printf("%s %*d %-*s %-*s %*s %s %s\n",
 			file.Mode(),
 			maxLinkLen, stat.Nlink,
 			maxUserLen, username,
 			maxGroupLen, groupname,
-			maxSizeLen, file.Size(),
-			file.ModTime().Format("Jan _2 15:04"),
-			coloredName,
-			namePadding)
+			maxSizeLen, size,
+			formatTime(file.ModTime()),
+			coloredName)
 	}
 }
+
+// Add this helper type and its methods
+type dirInfo struct {
+	name string
+}
+
+func (d *dirInfo) Name() string       { return d.name }
+func (d *dirInfo) IsDir() bool        { return true }
+func (d *dirInfo) Mode() os.FileMode  { return os.ModeDir }
+func (d *dirInfo) ModTime() time.Time { return time.Time{} }
+func (d *dirInfo) Size() int64        { return 0 }
+func (d *dirInfo) Sys() interface{}   { return nil }
