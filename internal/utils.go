@@ -38,8 +38,20 @@ func ListFiles(dir string, isRecursive bool) error {
 	}
 
 	var files []fs.FileInfo
+	if ShowAll {
+		// Add . and .. when ShowAll is true
+		currentDir, err := os.Stat(dir)
+		if err == nil {
+			files = append(files, currentDir)
+		}
+		parentDir, err := os.Stat(filepath.Dir(dir))
+		if err == nil {
+			files = append(files, &dotDotInfo{parentDir})
+		}
+	}
+
 	for _, entry := range entries {
-		info, err := os.Lstat(filepath.Join(dir, entry.Name()))
+		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
@@ -81,6 +93,15 @@ func ListFiles(dir string, isRecursive bool) error {
 	}
 
 	return nil
+}
+
+// Add this helper type to correctly represent ".." entry
+type dotDotInfo struct {
+	fs.FileInfo
+}
+
+func (d *dotDotInfo) Name() string {
+	return ".."
 }
 
 func calculateColumnWidths(names []string, termWidth, maxLen int) (int, int) {
